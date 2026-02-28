@@ -7,3 +7,7 @@ data:
   PORT: "8090"
   RECOMMENDER_URL: "http://recommender.profiler.svc.cluster.local/recommend"
   POD_TEMPLATE_PATH: "/etc/pod-template/pod.json"
+  DB_HOST: "profiler-postgresql.profiler.svc.cluster.local"
+  DB_PORT: "5432"
+  DB_NAME: "profiler"
+  DB_SSLMODE: "disable"

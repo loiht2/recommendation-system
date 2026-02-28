@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/tls"
 	"crypto/x509"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +13,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	_ "github.com/lib/pq"
 )
 
 // ---------------------------------------------------------------------------
@@ -22,6 +25,7 @@ type server struct {
 	recommenderURL  string
 	podTemplatePath string
 	k8s             *k8sClient
+	db              *sql.DB
 }
 
 // ---------------------------------------------------------------------------
@@ -87,13 +91,36 @@ func main() {
 	recommenderURL := getEnv("RECOMMENDER_URL", "http://recommender.profiler.svc.cluster.local/recommend")
 	podTemplatePath := getEnv("POD_TEMPLATE_PATH", "/etc/pod-template/pod.json")
 
+	dbHost := getEnv("DB_HOST", "profiler-postgresql.profiler.svc.cluster.local")
+	dbPort := getEnv("DB_PORT", "5432")
+	dbUser := getEnv("DB_USER", "profiler")
+	dbPass := getEnv("DB_PASSWORD", "profiler")
+	dbName := getEnv("DB_NAME", "profiler")
+	dbSSL := getEnv("DB_SSLMODE", "disable")
+
 	log.Printf("Web UI starting on :%s", port)
 	log.Printf("Recommender API   : %s", recommenderURL)
 	log.Printf("Pod template      : %s", podTemplatePath)
+	log.Printf("DB host           : %s:%s/%s", dbHost, dbPort, dbName)
 
 	s := &server{
 		recommenderURL:  recommenderURL,
 		podTemplatePath: podTemplatePath,
+	}
+
+	// PostgreSQL (read-only, for /db page)
+	dsn := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s", dbHost, dbPort, dbUser, dbPass, dbName, dbSSL)
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		log.Printf("WARNING: DB unavailable, /db page disabled: %v", err)
+	} else if err := db.Ping(); err != nil {
+		log.Printf("WARNING: DB ping failed, /db page disabled: %v", err)
+		db.Close()
+		db = nil
+	} else {
+		db.SetMaxOpenConns(3)
+		s.db = db
+		log.Println("PostgreSQL connected (read-only for /db)")
 	}
 
 	// In-cluster K8s client (optional — profiling disabled if unavailable)
@@ -108,10 +135,16 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/recommend", s.handleRecommend)
 	mux.HandleFunc("/api/profile", s.handleProfile)
+	mux.HandleFunc("/api/db", s.handleDBAPI)
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, "ok")
+	})
+
+	mux.HandleFunc("/db", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, dbPageHTML)
 	})
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -356,6 +389,101 @@ func getEnv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// ---------------------------------------------------------------------------
+// DB API handler
+// ---------------------------------------------------------------------------
+
+type dbRecord struct {
+	ID              int64   `json:"id"`
+	PodName         string  `json:"pod_name"`
+	PodNamespace    string  `json:"pod_namespace"`
+	PodUID          string  `json:"pod_uid"`
+	ContainerName   string  `json:"container_name"`
+	DeviceUUID      string  `json:"device_uuid"`
+	DeviceType      string  `json:"device_type"`
+	VDeviceID       string  `json:"vdevice_id"`
+	Image           string  `json:"image"`
+	ImageID         string  `json:"image_id"`
+	MetricName      string  `json:"metric_name"`
+	PeakValueMiB    float64 `json:"peak_value_mib"`
+	StartTime       string  `json:"start_time"`
+	EndTime         string  `json:"end_time"`
+	DurationSeconds float64 `json:"duration_seconds"`
+	CreatedAt       string  `json:"created_at"`
+	Source          string  `json:"source"` // "peak_usage" or "prerun_profile"
+}
+
+func (s *server) handleDBAPI(w http.ResponseWriter, r *http.Request) {
+	if s.db == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Database not connected"})
+		return
+	}
+
+	var records []dbRecord
+
+	// Query peak usage
+	rows1, err := s.db.Query(`SELECT id, pod_name, pod_namespace, pod_uid, container_name,
+		device_uuid, device_type, vdevice_id, image, image_id, metric_name,
+		peak_value_mib, pod_start_time, pod_end_time, duration_seconds, created_at
+		FROM vgpu_peak_usage ORDER BY created_at DESC LIMIT 200`)
+	if err != nil {
+		log.Printf("ERROR querying vgpu_peak_usage: %v", err)
+	} else {
+		defer rows1.Close()
+		for rows1.Next() {
+			var rec dbRecord
+			var startT, endT, createdT time.Time
+			if err := rows1.Scan(&rec.ID, &rec.PodName, &rec.PodNamespace, &rec.PodUID,
+				&rec.ContainerName, &rec.DeviceUUID, &rec.DeviceType, &rec.VDeviceID,
+				&rec.Image, &rec.ImageID, &rec.MetricName, &rec.PeakValueMiB,
+				&startT, &endT, &rec.DurationSeconds, &createdT); err != nil {
+				log.Printf("ERROR scanning peak_usage row: %v", err)
+				continue
+			}
+			rec.StartTime = startT.Format(time.RFC3339)
+			rec.EndTime = endT.Format(time.RFC3339)
+			rec.CreatedAt = createdT.Format(time.RFC3339)
+			rec.Source = "peak_usage"
+			records = append(records, rec)
+		}
+	}
+
+	// Query prerun profiles
+	rows2, err := s.db.Query(`SELECT id, pod_name, pod_namespace, pod_uid, container_name,
+		device_uuid, device_type, vdevice_id, image, image_id, metric_name,
+		peak_value_mib, profile_start, profile_end, duration_seconds, created_at
+		FROM vgpu_prerun_profile ORDER BY created_at DESC LIMIT 200`)
+	if err != nil {
+		log.Printf("ERROR querying vgpu_prerun_profile: %v", err)
+	} else {
+		defer rows2.Close()
+		for rows2.Next() {
+			var rec dbRecord
+			var startT, endT, createdT time.Time
+			if err := rows2.Scan(&rec.ID, &rec.PodName, &rec.PodNamespace, &rec.PodUID,
+				&rec.ContainerName, &rec.DeviceUUID, &rec.DeviceType, &rec.VDeviceID,
+				&rec.Image, &rec.ImageID, &rec.MetricName, &rec.PeakValueMiB,
+				&startT, &endT, &rec.DurationSeconds, &createdT); err != nil {
+				log.Printf("ERROR scanning prerun_profile row: %v", err)
+				continue
+			}
+			rec.StartTime = startT.Format(time.RFC3339)
+			rec.EndTime = endT.Format(time.RFC3339)
+			rec.CreatedAt = createdT.Format(time.RFC3339)
+			rec.Source = "prerun_profile"
+			records = append(records, rec)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"records": records,
+		"count":   len(records),
+	})
 }
 
 var indexHTML = strings.TrimSpace(`
@@ -649,6 +777,7 @@ var indexHTML = strings.TrimSpace(`
 
 <div class="footer">
   vGPU VRAM Recommendation System &mdash; Profiler + Recommender on Kubernetes
+  &nbsp;|&nbsp; <a href="/db" style="color:var(--primary)">View Database</a>
 </div>
 
 <script>
@@ -823,6 +952,285 @@ function showError(data) {
 document.getElementById('imageInput').addEventListener('keydown', function(e) {
   if (e.key === 'Enter') doRecommend();
 });
+</script>
+</body>
+</html>
+`)
+
+var dbPageHTML = strings.TrimSpace(`
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Database Viewer — vGPU VRAM</title>
+<style>
+  :root {
+    --bg: #0f172a;
+    --card: #1e293b;
+    --border: #334155;
+    --primary: #3b82f6;
+    --success: #22c55e;
+    --warning: #f59e0b;
+    --text: #f1f5f9;
+    --muted: #94a3b8;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+  }
+  .header {
+    padding: 20px 24px;
+    border-bottom: 1px solid var(--border);
+    background: var(--card);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .header h1 {
+    font-size: 1.4rem;
+    font-weight: 700;
+    background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .header a {
+    color: var(--primary);
+    text-decoration: none;
+    font-size: 0.9rem;
+  }
+  .header a:hover { text-decoration: underline; }
+
+  .toolbar {
+    padding: 16px 24px;
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .toolbar .count {
+    color: var(--muted);
+    font-size: 0.85rem;
+    margin-left: auto;
+  }
+  .toolbar button {
+    padding: 8px 16px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--card);
+    color: var(--text);
+    font-size: 0.85rem;
+    cursor: pointer;
+    transition: border-color 0.2s;
+  }
+  .toolbar button:hover { border-color: var(--primary); }
+  .toolbar button.active { border-color: var(--primary); background: rgba(59,130,246,0.15); }
+  .toolbar input {
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 0.85rem;
+    outline: none;
+    width: 220px;
+  }
+  .toolbar input:focus { border-color: var(--primary); }
+  .toolbar input::placeholder { color: #475569; }
+
+  .table-wrap {
+    padding: 0 24px 24px;
+    overflow-x: auto;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.82rem;
+  }
+  th {
+    position: sticky;
+    top: 0;
+    background: var(--card);
+    color: var(--muted);
+    text-transform: uppercase;
+    font-size: 0.7rem;
+    letter-spacing: 0.05em;
+    padding: 10px 8px;
+    text-align: left;
+    border-bottom: 2px solid var(--border);
+    white-space: nowrap;
+    cursor: pointer;
+    user-select: none;
+  }
+  th:hover { color: var(--text); }
+  th .sort-arrow { font-size: 0.65rem; margin-left: 3px; }
+  td {
+    padding: 8px;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+    max-width: 240px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  td.num { text-align: right; font-family: 'Courier New', monospace; }
+  tr:hover td { background: rgba(59,130,246,0.05); }
+  .badge-src {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 0.7rem;
+    font-weight: 600;
+  }
+  .badge-peak { background: #166534; color: #bbf7d0; }
+  .badge-prerun { background: #92400e; color: #fde68a; }
+  .loading {
+    text-align: center;
+    padding: 60px;
+    color: var(--muted);
+    font-size: 1rem;
+  }
+  .error-box {
+    margin: 24px;
+    padding: 16px;
+    background: #450a0a;
+    border: 1px solid #dc2626;
+    border-radius: 8px;
+    color: #fecaca;
+  }
+  .empty {
+    text-align: center;
+    padding: 60px;
+    color: var(--muted);
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>&#x1F4BE; Database Viewer</h1>
+  <a href="/">&#x2190; Back to Dashboard</a>
+</div>
+
+<div class="toolbar">
+  <button class="active" onclick="setFilter('all')">All</button>
+  <button onclick="setFilter('peak_usage')">Peak Usage</button>
+  <button onclick="setFilter('prerun_profile')">Pre-run Profile</button>
+  <input type="text" id="searchInput" placeholder="Search pod, image, device..." oninput="applyFilter()">
+  <span class="count" id="countLabel">Loading...</span>
+</div>
+
+<div class="table-wrap">
+  <div id="content" class="loading">Loading data...</div>
+</div>
+
+<script>
+let allRecords = [];
+let currentFilter = 'all';
+let sortCol = 'created_at';
+let sortDir = -1; // -1 = desc
+
+async function loadData() {
+  try {
+    const resp = await fetch('/api/db');
+    const data = await resp.json();
+    if (data.error) {
+      document.getElementById('content').innerHTML = '<div class="error-box">' + data.error + '</div>';
+      return;
+    }
+    allRecords = data.records || [];
+    render();
+  } catch (err) {
+    document.getElementById('content').innerHTML = '<div class="error-box">Failed to load: ' + err.message + '</div>';
+  }
+}
+
+function setFilter(f) {
+  currentFilter = f;
+  document.querySelectorAll('.toolbar button').forEach(b => b.classList.remove('active'));
+  event.target.classList.add('active');
+  render();
+}
+
+function applyFilter() { render(); }
+
+function setSort(col) {
+  if (sortCol === col) { sortDir *= -1; }
+  else { sortCol = col; sortDir = -1; }
+  render();
+}
+
+function render() {
+  const search = (document.getElementById('searchInput').value || '').toLowerCase();
+  let filtered = allRecords.filter(r => {
+    if (currentFilter !== 'all' && r.source !== currentFilter) return false;
+    if (search) {
+      const hay = (r.pod_name + ' ' + r.pod_namespace + ' ' + r.image + ' ' + r.device_type + ' ' + r.container_name + ' ' + r.image_id).toLowerCase();
+      if (!hay.includes(search)) return false;
+    }
+    return true;
+  });
+
+  filtered.sort((a, b) => {
+    let va = a[sortCol], vb = b[sortCol];
+    if (typeof va === 'number') return (va - vb) * sortDir;
+    return String(va).localeCompare(String(vb)) * sortDir;
+  });
+
+  document.getElementById('countLabel').textContent = filtered.length + ' of ' + allRecords.length + ' records';
+
+  if (filtered.length === 0) {
+    document.getElementById('content').innerHTML = '<div class="empty">No records found.</div>';
+    return;
+  }
+
+  const arrow = (col) => sortCol === col ? '<span class="sort-arrow">' + (sortDir > 0 ? '&#x25B2;' : '&#x25BC;') + '</span>' : '';
+
+  let html = '<table><thead><tr>';
+  const cols = [
+    { key: 'id', label: 'ID' },
+    { key: 'source', label: 'Source' },
+    { key: 'pod_name', label: 'Pod' },
+    { key: 'pod_namespace', label: 'Namespace' },
+    { key: 'container_name', label: 'Container' },
+    { key: 'image', label: 'Image' },
+    { key: 'device_type', label: 'GPU Type' },
+    { key: 'peak_value_mib', label: 'Peak MiB' },
+    { key: 'duration_seconds', label: 'Duration (s)' },
+    { key: 'created_at', label: 'Created At' },
+  ];
+  cols.forEach(c => {
+    html += '<th onclick="setSort(\'' + c.key + '\')">' + c.label + arrow(c.key) + '</th>';
+  });
+  html += '</tr></thead><tbody>';
+
+  filtered.forEach(r => {
+    const srcClass = r.source === 'peak_usage' ? 'badge-peak' : 'badge-prerun';
+    const srcLabel = r.source === 'peak_usage' ? 'Peak' : 'Pre-run';
+    const created = r.created_at ? r.created_at.replace('T', ' ').substring(0, 19) : '';
+    html += '<tr>';
+    html += '<td class="num">' + r.id + '</td>';
+    html += '<td><span class="badge-src ' + srcClass + '">' + srcLabel + '</span></td>';
+    html += '<td title="' + r.pod_name + '">' + r.pod_name + '</td>';
+    html += '<td>' + r.pod_namespace + '</td>';
+    html += '<td>' + r.container_name + '</td>';
+    html += '<td title="' + (r.image_id || r.image) + '">' + r.image + '</td>';
+    html += '<td>' + r.device_type + '</td>';
+    html += '<td class="num" style="color:var(--success);font-weight:600">' + r.peak_value_mib + '</td>';
+    html += '<td class="num">' + (r.duration_seconds ? r.duration_seconds.toFixed(1) : '-') + '</td>';
+    html += '<td>' + created + '</td>';
+    html += '</tr>';
+  });
+
+  html += '</tbody></table>';
+  document.getElementById('content').innerHTML = html;
+}
+
+loadData();
+// Auto-refresh every 30 seconds
+setInterval(loadData, 30000);
 </script>
 </body>
 </html>

@@ -26,6 +26,8 @@ spec:
           envFrom:
             - configMapRef:
                 name: web-ui-config
+            - secretRef:
+                name: profiler-secret
           volumeMounts:
             - name: pod-template
               mountPath: /etc/pod-template
