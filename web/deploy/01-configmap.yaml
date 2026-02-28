@@ -6,3 +6,4 @@ metadata:
 data:
   PORT: "8090"
   RECOMMENDER_URL: "http://recommender.profiler.svc.cluster.local/recommend"
+  POD_TEMPLATE_PATH: "/etc/pod-template/pod.json"

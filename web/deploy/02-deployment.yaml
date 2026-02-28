@@ -15,6 +15,7 @@ spec:
       labels:
         app: web-ui
     spec:
+      serviceAccountName: web-ui
       containers:
         - name: web-ui
           image: docker.io/loihoangthanh1411/recommendation-web:v1.0
@@ -25,6 +26,10 @@ spec:
           envFrom:
             - configMapRef:
                 name: web-ui-config
+          volumeMounts:
+            - name: pod-template
+              mountPath: /etc/pod-template
+              readOnly: true
           readinessProbe:
             httpGet:
               path: /healthz
@@ -44,4 +49,8 @@ spec:
             limits:
               cpu: 100m
               memory: 64Mi
+      volumes:
+        - name: pod-template
+          configMap:
+            name: pod-template
       restartPolicy: Always

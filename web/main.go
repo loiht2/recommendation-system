@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,50 +14,106 @@ import (
 	"time"
 )
 
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
+
+type server struct {
+	recommenderURL  string
+	podTemplatePath string
+	k8s             *k8sClient
+}
+
+// ---------------------------------------------------------------------------
+// K8s REST client (zero external dependencies)
+// ---------------------------------------------------------------------------
+
+type k8sClient struct {
+	baseURL    string
+	token      string
+	httpClient *http.Client
+}
+
+func newK8sClient() (*k8sClient, error) {
+	host := os.Getenv("KUBERNETES_SERVICE_HOST")
+	port := os.Getenv("KUBERNETES_SERVICE_PORT")
+	if host == "" || port == "" {
+		return nil, fmt.Errorf("KUBERNETES_SERVICE_HOST/PORT not set")
+	}
+
+	token, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
+	if err != nil {
+		return nil, fmt.Errorf("reading SA token: %w", err)
+	}
+
+	caCert, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+	if err != nil {
+		return nil, fmt.Errorf("reading CA cert: %w", err)
+	}
+
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(caCert)
+
+	return &k8sClient{
+		baseURL: fmt.Sprintf("https://%s:%s", host, port),
+		token:   strings.TrimSpace(string(token)),
+		httpClient: &http.Client{
+			Timeout:   15 * time.Second,
+			Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}},
+		},
+	}, nil
+}
+
+func (c *k8sClient) do(method, path string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest(method, c.baseURL+path, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	return c.httpClient.Do(req)
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
 	port := getEnv("PORT", "8090")
 	recommenderURL := getEnv("RECOMMENDER_URL", "http://recommender.profiler.svc.cluster.local/recommend")
+	podTemplatePath := getEnv("POD_TEMPLATE_PATH", "/etc/pod-template/pod.json")
 
 	log.Printf("Web UI starting on :%s", port)
-	log.Printf("Recommender API: %s", recommenderURL)
+	log.Printf("Recommender API   : %s", recommenderURL)
+	log.Printf("Pod template      : %s", podTemplatePath)
+
+	s := &server{
+		recommenderURL:  recommenderURL,
+		podTemplatePath: podTemplatePath,
+	}
+
+	// In-cluster K8s client (optional — profiling disabled if unavailable)
+	k8s, err := newK8sClient()
+	if err != nil {
+		log.Printf("WARNING: K8s client unavailable, Profile button disabled: %v", err)
+	} else {
+		s.k8s = k8s
+		log.Println("K8s in-cluster client ready")
+	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/api/recommend", s.handleRecommend)
+	mux.HandleFunc("/api/profile", s.handleProfile)
 
-	// API proxy to recommender
-	mux.HandleFunc("/api/recommend", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		client := &http.Client{Timeout: 30 * time.Second}
-		resp, err := client.Post(recommenderURL, "application/json", r.Body)
-		if err != nil {
-			log.Printf("ERROR proxying to recommender: %v", err)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusBadGateway)
-			json.NewEncoder(w).Encode(map[string]string{
-				"error":   "Failed to reach recommender service",
-				"details": err.Error(),
-			})
-			return
-		}
-		defer resp.Body.Close()
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
-	})
-
-	// Health check
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, "ok")
 	})
 
-	// Serve static HTML
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" && r.URL.Path != "/index.html" {
 			http.NotFound(w, r)
@@ -68,11 +127,229 @@ func main() {
 		Addr:         ":" + port,
 		Handler:      mux,
 		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 60 * time.Second,
+		WriteTimeout: 180 * time.Second, // long for streaming profile
 	}
 
 	log.Fatal(srv.ListenAndServe())
 }
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
+
+func (s *server) handleRecommend(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Post(s.recommenderURL, "application/json", r.Body)
+	if err != nil {
+		log.Printf("ERROR proxying to recommender: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error":   "Failed to reach recommender service",
+			"details": err.Error(),
+		})
+		return
+	}
+	defer resp.Body.Close()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+}
+
+// handleProfile streams NDJSON progress while running a full profiling cycle:
+// create pod → wait for profiler to capture & delete → query recommendation.
+func (s *server) handleProfile(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+
+	send := func(data map[string]interface{}) {
+		b, _ := json.Marshal(data)
+		w.Write(b)
+		w.Write([]byte("\n"))
+		flusher.Flush()
+	}
+	step := func(msg string) {
+		log.Printf("Profile step: %s", msg)
+		send(map[string]interface{}{"type": "step", "message": msg})
+	}
+	sendErr := func(errMsg, details string) {
+		log.Printf("Profile error: %s — %s", errMsg, details)
+		send(map[string]interface{}{"type": "error", "error": errMsg, "details": details})
+	}
+
+	if s.k8s == nil {
+		sendErr("K8s client not available", "Web UI is not running inside a K8s cluster")
+		return
+	}
+
+	// ---- 1. Read pod template ----
+	step("Reading pod template...")
+	podJSON, err := os.ReadFile(s.podTemplatePath)
+	if err != nil {
+		sendErr("Failed to read pod template", err.Error())
+		return
+	}
+
+	var podMeta struct {
+		Metadata struct {
+			Name      string `json:"name"`
+			Namespace string `json:"namespace"`
+		} `json:"metadata"`
+		Spec struct {
+			Containers []struct {
+				Image string `json:"image"`
+			} `json:"containers"`
+		} `json:"spec"`
+	}
+	if err := json.Unmarshal(podJSON, &podMeta); err != nil {
+		sendErr("Failed to parse pod template JSON", err.Error())
+		return
+	}
+
+	podName := podMeta.Metadata.Name
+	podNS := podMeta.Metadata.Namespace
+	podImage := ""
+	if len(podMeta.Spec.Containers) > 0 {
+		podImage = podMeta.Spec.Containers[0].Image
+	}
+	podPath := fmt.Sprintf("/api/v1/namespaces/%s/pods/%s", podNS, podName)
+
+	step(fmt.Sprintf("Pod: %s/%s  Image: %s", podNS, podName, podImage))
+
+	// ---- 2. Delete existing pod (ignore 404) ----
+	step("Cleaning up any existing pod...")
+	if resp, err := s.k8s.do("DELETE", podPath, nil); err == nil {
+		io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode == 200 || resp.StatusCode == 202 {
+			for i := 0; i < 30; i++ {
+				time.Sleep(2 * time.Second)
+				chk, err := s.k8s.do("GET", podPath, nil)
+				if err != nil {
+					break
+				}
+				chk.Body.Close()
+				if chk.StatusCode == 404 {
+					break
+				}
+			}
+		}
+	}
+
+	// ---- 3. Create pod ----
+	step(fmt.Sprintf("Creating profiling pod %s/%s...", podNS, podName))
+	resp, err := s.k8s.do("POST", fmt.Sprintf("/api/v1/namespaces/%s/pods", podNS), bytes.NewReader(podJSON))
+	if err != nil {
+		sendErr("Failed to create pod", err.Error())
+		return
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 201 {
+		sendErr(fmt.Sprintf("K8s API returned %d creating pod", resp.StatusCode), string(respBody))
+		return
+	}
+
+	// ---- 4. Wait for Running ----
+	step("Waiting for pod to start running...")
+	running := false
+	for i := 0; i < 60; i++ {
+		time.Sleep(2 * time.Second)
+		chk, err := s.k8s.do("GET", podPath, nil)
+		if err != nil {
+			running = true
+			break
+		}
+		bdy, _ := io.ReadAll(chk.Body)
+		chk.Body.Close()
+		if chk.StatusCode == 404 {
+			running = true
+			break
+		}
+		var ps struct {
+			Status struct {
+				Phase string `json:"phase"`
+			} `json:"status"`
+		}
+		json.Unmarshal(bdy, &ps)
+		if ps.Status.Phase == "Running" {
+			running = true
+			step("Pod is Running — profiler capturing VRAM for ~45 seconds...")
+			break
+		}
+		if ps.Status.Phase == "Failed" || ps.Status.Phase == "Unknown" {
+			sendErr("Pod failed to start", fmt.Sprintf("Phase: %s", ps.Status.Phase))
+			return
+		}
+	}
+	if !running {
+		sendErr("Timeout", "Pod did not reach Running within 120 seconds")
+		return
+	}
+
+	// ---- 5. Wait for profiler to delete the pod ----
+	deleted := false
+	for i := 0; i < 50; i++ {
+		time.Sleep(2 * time.Second)
+		chk, err := s.k8s.do("GET", podPath, nil)
+		if err != nil {
+			deleted = true
+			break
+		}
+		chk.Body.Close()
+		if chk.StatusCode == 404 {
+			deleted = true
+			break
+		}
+	}
+	if !deleted {
+		sendErr("Profiling timed out", "Pod was not deleted by profiler within expected time")
+		return
+	}
+
+	step("Profiling complete! Fetching recommendation...")
+	time.Sleep(3 * time.Second)
+
+	// ---- 6. Query recommender ----
+	if podImage == "" {
+		sendErr("Cannot query recommender", "No container image found in pod template")
+		return
+	}
+	reqBody, _ := json.Marshal(map[string]string{"image_url": podImage})
+	client := &http.Client{Timeout: 30 * time.Second}
+	recResp, err := client.Post(s.recommenderURL, "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		sendErr("Recommender unreachable", err.Error())
+		return
+	}
+	defer recResp.Body.Close()
+	recBody, _ := io.ReadAll(recResp.Body)
+
+	var result interface{}
+	json.Unmarshal(recBody, &result)
+	send(map[string]interface{}{"type": "result", "data": result})
+	log.Printf("Profile: completed for %s/%s", podNS, podName)
+}
+
+// ---------------------------------------------------------------------------
 
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
@@ -95,6 +372,8 @@ var indexHTML = strings.TrimSpace(`
     --border: #334155;
     --primary: #3b82f6;
     --primary-hover: #2563eb;
+    --accent: #8b5cf6;
+    --accent-hover: #7c3aed;
     --success: #22c55e;
     --warning: #f59e0b;
     --danger: #ef4444;
@@ -171,7 +450,6 @@ var indexHTML = strings.TrimSpace(`
   input[type="text"]::placeholder { color: #475569; }
   button {
     padding: 12px 24px;
-    background: var(--primary);
     border: none;
     border-radius: 8px;
     color: white;
@@ -181,11 +459,11 @@ var indexHTML = strings.TrimSpace(`
     transition: background 0.2s;
     white-space: nowrap;
   }
-  button:hover { background: var(--primary-hover); }
-  button:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
+  .btn-recommend { background: var(--primary); }
+  .btn-recommend:hover { background: var(--primary-hover); }
+  .btn-profile { background: var(--accent); }
+  .btn-profile:hover { background: var(--accent-hover); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
   .spinner {
     display: inline-block;
     width: 16px;
@@ -198,7 +476,32 @@ var indexHTML = strings.TrimSpace(`
     margin-right: 6px;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+  .btn-row {
+    display: flex;
+    gap: 8px;
+    margin-top: 12px;
+  }
+  .btn-row p {
+    font-size: 0.8rem;
+    color: var(--muted);
+    align-self: center;
+  }
 
+  /* Progress log */
+  #progress { display: none; }
+  .step-item {
+    padding: 8px 12px;
+    margin-bottom: 4px;
+    border-left: 3px solid var(--accent);
+    background: rgba(139,92,246,0.08);
+    border-radius: 0 6px 6px 0;
+    font-size: 0.85rem;
+    font-family: 'Courier New', monospace;
+    animation: fadeIn 0.3s ease;
+  }
+  @keyframes fadeIn { from { opacity: 0; transform: translateX(-8px); } to { opacity: 1; transform: translateX(0); } }
+
+  /* Result */
   #result { display: none; }
   .result-header {
     display: flex;
@@ -272,9 +575,7 @@ var indexHTML = strings.TrimSpace(`
   .message-box.warn { background: #422006; border: 1px solid #d97706; }
   .message-box.err  { background: #450a0a; border: 1px solid #dc2626; }
 
-  .examples {
-    margin-top: 12px;
-  }
+  .examples { margin-top: 12px; }
   .examples span {
     display: inline-block;
     padding: 4px 10px;
@@ -310,13 +611,17 @@ var indexHTML = strings.TrimSpace(`
 <div class="container">
   <!-- Input card -->
   <div class="card">
-    <h2>&#x1F50D; Query Recommendation</h2>
+    <h2>&#x1F50D; Query &amp; Profile</h2>
     <div class="form-group">
       <label>Container Image URL</label>
       <div class="input-row">
         <input type="text" id="imageInput" placeholder="e.g. docker.io/library/nginx:latest" />
-        <button id="submitBtn" onclick="doRecommend()">Recommend</button>
       </div>
+    </div>
+    <div class="btn-row">
+      <button class="btn-recommend" id="submitBtn" onclick="doRecommend()">&#x1F4CA; Recommend</button>
+      <button class="btn-profile" id="profileBtn" onclick="doProfile()">&#x26A1; Profile</button>
+      <p>Recommend = query existing data &nbsp;|&nbsp; Profile = run GPU pod, capture VRAM, get recommendation</p>
     </div>
     <div class="examples">
       <label style="font-size:0.8rem;color:var(--muted);">Try examples:</label>
@@ -326,13 +631,18 @@ var indexHTML = strings.TrimSpace(`
     </div>
   </div>
 
+  <!-- Progress card (profiling only) -->
+  <div class="card" id="progress">
+    <h2>&#x23F3; Profiling Progress</h2>
+    <div id="progressLog"></div>
+  </div>
+
   <!-- Result card -->
   <div class="card" id="result">
     <div class="result-header">
       <h2>&#x1F4CA; Result</h2>
       <span class="badge" id="statusBadge"></span>
     </div>
-
     <div id="resultContent"></div>
   </div>
 </div>
@@ -346,14 +656,21 @@ function setImage(img) {
   document.getElementById('imageInput').value = img;
 }
 
+function setButtons(disabled) {
+  document.getElementById('submitBtn').disabled = disabled;
+  document.getElementById('profileBtn').disabled = disabled;
+}
+
+// ---- Recommend (existing data) ----
 async function doRecommend() {
   const input = document.getElementById('imageInput').value.trim();
   if (!input) { alert('Please enter an image URL'); return; }
 
+  setButtons(true);
   const btn = document.getElementById('submitBtn');
-  btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span>Querying...';
 
+  document.getElementById('progress').style.display = 'none';
   const resultDiv = document.getElementById('result');
   resultDiv.style.display = 'block';
   document.getElementById('resultContent').innerHTML = '<p style="color:var(--muted)">Loading...</p>';
@@ -364,34 +681,87 @@ async function doRecommend() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ image_url: input })
     });
-
     const data = await resp.json();
-
-    if (data.error) {
-      showError(data);
-      return;
-    }
-
-    if (data.status === 'ok') {
-      showOK(data);
-    } else if (data.status === 'profiling_required') {
-      showProfiling(data);
-    } else {
-      showError({ error: 'Unexpected response', details: JSON.stringify(data) });
-    }
+    if (data.error) { showError(data); return; }
+    if (data.status === 'ok') { showOK(data); }
+    else if (data.status === 'profiling_required') { showProfilingRequired(data); }
+    else { showError({ error: 'Unexpected response', details: JSON.stringify(data) }); }
   } catch (err) {
     showError({ error: 'Network error', details: err.message });
   } finally {
-    btn.disabled = false;
-    btn.innerHTML = 'Recommend';
+    setButtons(false);
+    btn.innerHTML = '&#x1F4CA; Recommend';
   }
 }
 
+// ---- Profile (run pod, capture, recommend) ----
+async function doProfile() {
+  setButtons(true);
+  const btn = document.getElementById('profileBtn');
+  btn.innerHTML = '<span class="spinner"></span>Profiling...';
+
+  const progressDiv = document.getElementById('progress');
+  const progressLog = document.getElementById('progressLog');
+  progressDiv.style.display = 'block';
+  progressLog.innerHTML = '';
+  document.getElementById('result').style.display = 'none';
+
+  function addStep(msg) {
+    const el = document.createElement('div');
+    el.className = 'step-item';
+    el.textContent = msg;
+    progressLog.appendChild(el);
+    el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+
+  try {
+    const resp = await fetch('/api/profile', { method: 'POST' });
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const event = JSON.parse(line);
+          if (event.type === 'step') {
+            addStep(event.message);
+          } else if (event.type === 'result') {
+            addStep('Done!');
+            const data = event.data;
+            document.getElementById('result').style.display = 'block';
+            if (data && data.status === 'ok') { showOK(data); }
+            else if (data && data.status === 'profiling_required') { showProfilingRequired(data); }
+            else if (data && data.error) { showError(data); }
+            else { showError({ error: 'Unexpected result', details: JSON.stringify(data) }); }
+          } else if (event.type === 'error') {
+            addStep('ERROR: ' + event.error);
+            document.getElementById('result').style.display = 'block';
+            showError(event);
+          }
+        } catch(e) { /* ignore parse errors */ }
+      }
+    }
+  } catch (err) {
+    document.getElementById('result').style.display = 'block';
+    showError({ error: 'Network error', details: err.message });
+  } finally {
+    setButtons(false);
+    btn.innerHTML = '&#x26A1; Profile';
+  }
+}
+
+// ---- Display helpers ----
 function showOK(data) {
   const badge = document.getElementById('statusBadge');
   badge.className = 'badge badge-ok';
   badge.textContent = 'Recommendation Available';
-
   const rec = data.recommendation;
   document.getElementById('resultContent').innerHTML = ` + "`" + `
     <div class="stats-grid">
@@ -413,44 +783,27 @@ function showOK(data) {
       </div>
     </div>
     <div style="margin-top:16px">
-      <div class="info-row">
-        <span class="key">Image URL</span>
-        <span class="val">${data.image_url}</span>
-      </div>
-      <div class="info-row">
-        <span class="key">Image Digest</span>
-        <span class="val">${data.image_digest}</span>
-      </div>
-      <div class="info-row">
-        <span class="key">Data Source</span>
-        <span class="val">${rec.source}</span>
-      </div>
+      <div class="info-row"><span class="key">Image URL</span><span class="val">${data.image_url}</span></div>
+      <div class="info-row"><span class="key">Image Digest</span><span class="val">${data.image_digest}</span></div>
+      <div class="info-row"><span class="key">Data Source</span><span class="val">${rec.source}</span></div>
     </div>
     <div class="message-box info">${data.message}</div>
   ` + "`" + `;
 }
 
-function showProfiling(data) {
+function showProfilingRequired(data) {
   const badge = document.getElementById('statusBadge');
   badge.className = 'badge badge-profiling';
   badge.textContent = 'Profiling Required';
-
   document.getElementById('resultContent').innerHTML = ` + "`" + `
     <div style="margin-top:8px">
-      <div class="info-row">
-        <span class="key">Image URL</span>
-        <span class="val">${data.image_url}</span>
-      </div>
-      <div class="info-row">
-        <span class="key">Image Digest</span>
-        <span class="val">${data.image_digest}</span>
-      </div>
+      <div class="info-row"><span class="key">Image URL</span><span class="val">${data.image_url}</span></div>
+      <div class="info-row"><span class="key">Image Digest</span><span class="val">${data.image_digest}</span></div>
     </div>
     <div class="message-box warn">
       <strong>&#x26A0; No Historical Data</strong><br>
       ${data.message}<br><br>
-      To profile this image, create a pod with the label <code>vram-profiling: "true"</code>.
-      The profiler will automatically capture VRAM usage during a 45-second window.
+      Click the <strong>&#x26A1; Profile</strong> button to automatically run a profiling pod and capture VRAM usage.
     </div>
   ` + "`" + `;
 }
@@ -459,7 +812,6 @@ function showError(data) {
   const badge = document.getElementById('statusBadge');
   badge.className = 'badge badge-error';
   badge.textContent = 'Error';
-
   document.getElementById('resultContent').innerHTML = ` + "`" + `
     <div class="message-box err">
       <strong>&#x274C; ${data.error}</strong>
@@ -468,7 +820,6 @@ function showError(data) {
   ` + "`" + `;
 }
 
-// Submit on Enter
 document.getElementById('imageInput').addEventListener('keydown', function(e) {
   if (e.key === 'Enter') doRecommend();
 });

@@ -1,0 +1,59 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pod-template
+  namespace: profiler
+data:
+  pod.json: |
+    {
+      "apiVersion": "v1",
+      "kind": "Pod",
+      "metadata": {
+        "name": "pod-hami-dra-02",
+        "namespace": "test-dra",
+        "labels": {
+          "vram-profiling": "true"
+        }
+      },
+      "spec": {
+        "schedulerName": "volcano",
+        "restartPolicy": "Never",
+        "containers": [
+          {
+            "name": "trainer",
+            "image": "deepspeed/deepspeed:latest",
+            "command": ["/bin/bash", "-c"],
+            "args": [
+              "python -m pip install --upgrade pip;\npip install transformers==4.18.0;\nexport PYTHONPATH=/home/deepspeed/.local/lib/python3.6/site-packages:$PYTHONPATH;\ndeepspeed --num_gpus=1 /workspace/train.py\n"
+            ],
+            "resources": {
+              "claims": [
+                {"name": "single-gpu"}
+              ]
+            },
+            "env": [
+              {"name": "OMP_NUM_THREADS", "value": "1"},
+              {"name": "PYTHONPATH", "value": "/home/deepspeed/.local/lib/python3.6/site-packages"}
+            ],
+            "volumeMounts": [
+              {"name": "workspace", "mountPath": "/workspace"}
+            ],
+            "imagePullPolicy": "IfNotPresent"
+          }
+        ],
+        "volumes": [
+          {
+            "name": "workspace",
+            "configMap": {
+              "name": "train-script"
+            }
+          }
+        ],
+        "resourceClaims": [
+          {
+            "name": "single-gpu",
+            "resourceClaimName": "single-gpu-0"
+          }
+        ]
+      }
+    }
