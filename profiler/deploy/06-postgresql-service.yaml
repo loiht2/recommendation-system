@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: profiler-postgresql
+  namespace: profiler
+  labels:
+    app: profiler-postgresql
+spec:
+  type: ClusterIP
+  selector:
+    app: profiler-postgresql
+  ports:
+    - port: 5432
+      targetPort: 5432
+      protocol: TCP
+      name: postgres

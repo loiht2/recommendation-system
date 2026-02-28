@@ -1,0 +1,25 @@
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Go build output / binaries
+*-bin
+/profiler/profiler
+/recommender/recommender
+/web/web-ui
+
+# Vendored / embedded repos
+profiler/client_golang/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test pod manifests (local testing only)
+pod-hami-dra.yaml

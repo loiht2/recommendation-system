@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: profiler-config
+  namespace: profiler
+data:
+  # Prometheus
+  PROMETHEUS_URL: "http://kube-prometheus-stack-prometheus.prometheus.svc.cluster.local:9090"
+
+  # The vGPU metric to query for peak usage (used with max_over_time)
+  VRAM_METRIC: "vGPU_device_memory_usage_real_in_MiB"
+
+  # Label on pods to watch for training completion (key=value)
+  WATCH_LABEL: "job-type=training"
+
+  # Label on pods to watch for pre-run VRAM profiling (key=value)
+  PROFILING_LABEL: "vram-profiling=true"
+
+  # How long to collect VRAM data before saving and deleting the pod
+  PROFILING_DURATION: "45s"
+
+  # Health endpoint port for liveness/readiness probes
+  HEALTH_PORT: ":8081"
+
+  # PostgreSQL
+  DB_HOST: "profiler-postgresql.profiler.svc.cluster.local"
+  DB_PORT: "5432"
+  DB_NAME: "profiler"
+  DB_SSLMODE: "disable"
+
+  # Postgres container config
+  POSTGRES_DB: "profiler"

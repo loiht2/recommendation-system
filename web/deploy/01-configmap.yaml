@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: web-ui-config
+  namespace: profiler
+data:
+  PORT: "8090"
+  RECOMMENDER_URL: "http://recommender.profiler.svc.cluster.local/recommend"

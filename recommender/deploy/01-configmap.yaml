@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: recommender-config
+  namespace: profiler
+data:
+  LISTEN_ADDR: ":8080"
+  DB_HOST: "profiler-postgresql.profiler.svc.cluster.local"
+  DB_PORT: "5432"
+  DB_NAME: "profiler"
+  DB_SSLMODE: "disable"
+  SAFETY_BUFFER_PERCENT: "10"
