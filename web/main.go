@@ -411,6 +411,7 @@ type dbRecord struct {
 	StartTime       string  `json:"start_time"`
 	EndTime         string  `json:"end_time"`
 	DurationSeconds float64 `json:"duration_seconds"`
+	PodPhase        string  `json:"pod_phase"`
 	CreatedAt       string  `json:"created_at"`
 	Source          string  `json:"source"` // "peak_usage" or "prerun_profile"
 }
@@ -428,7 +429,7 @@ func (s *server) handleDBAPI(w http.ResponseWriter, r *http.Request) {
 	// Query peak usage
 	rows1, err := s.db.Query(`SELECT id, pod_name, pod_namespace, pod_uid, container_name,
 		device_uuid, device_type, vdevice_id, image, image_id, metric_name,
-		peak_value_mib, pod_start_time, pod_end_time, duration_seconds, created_at
+		peak_value_mib, pod_start_time, pod_end_time, duration_seconds, pod_phase, created_at
 		FROM vgpu_peak_usage ORDER BY created_at DESC LIMIT 200`)
 	if err != nil {
 		log.Printf("ERROR querying vgpu_peak_usage: %v", err)
@@ -440,7 +441,7 @@ func (s *server) handleDBAPI(w http.ResponseWriter, r *http.Request) {
 			if err := rows1.Scan(&rec.ID, &rec.PodName, &rec.PodNamespace, &rec.PodUID,
 				&rec.ContainerName, &rec.DeviceUUID, &rec.DeviceType, &rec.VDeviceID,
 				&rec.Image, &rec.ImageID, &rec.MetricName, &rec.PeakValueMiB,
-				&startT, &endT, &rec.DurationSeconds, &createdT); err != nil {
+				&startT, &endT, &rec.DurationSeconds, &rec.PodPhase, &createdT); err != nil {
 				log.Printf("ERROR scanning peak_usage row: %v", err)
 				continue
 			}
@@ -1194,11 +1195,19 @@ function render() {
     { key: 'source', label: 'Source' },
     { key: 'pod_name', label: 'Pod' },
     { key: 'pod_namespace', label: 'Namespace' },
+    { key: 'pod_uid', label: 'Pod UID' },
     { key: 'container_name', label: 'Container' },
-    { key: 'image', label: 'Image' },
+    { key: 'device_uuid', label: 'Device UUID' },
     { key: 'device_type', label: 'GPU Type' },
+    { key: 'vdevice_id', label: 'VDevice ID' },
+    { key: 'image', label: 'Image' },
+    { key: 'image_id', label: 'Image ID' },
+    { key: 'metric_name', label: 'Metric' },
     { key: 'peak_value_mib', label: 'Peak MiB' },
+    { key: 'start_time', label: 'Start Time' },
+    { key: 'end_time', label: 'End Time' },
     { key: 'duration_seconds', label: 'Duration (s)' },
+    { key: 'pod_phase', label: 'Pod Phase' },
     { key: 'created_at', label: 'Created At' },
   ];
   cols.forEach(c => {
@@ -1209,18 +1218,26 @@ function render() {
   filtered.forEach(r => {
     const srcClass = r.source === 'peak_usage' ? 'badge-peak' : 'badge-prerun';
     const srcLabel = r.source === 'peak_usage' ? 'Peak' : 'Pre-run';
-    const created = r.created_at ? r.created_at.replace('T', ' ').substring(0, 19) : '';
+    const fmtTime = (t) => t ? t.replace('T', ' ').substring(0, 19) : '-';
     html += '<tr>';
     html += '<td class="num">' + r.id + '</td>';
     html += '<td><span class="badge-src ' + srcClass + '">' + srcLabel + '</span></td>';
-    html += '<td title="' + r.pod_name + '">' + r.pod_name + '</td>';
-    html += '<td>' + r.pod_namespace + '</td>';
-    html += '<td>' + r.container_name + '</td>';
-    html += '<td title="' + (r.image_id || r.image) + '">' + r.image + '</td>';
-    html += '<td>' + r.device_type + '</td>';
+    html += '<td title="' + (r.pod_name||'') + '">' + (r.pod_name||'') + '</td>';
+    html += '<td>' + (r.pod_namespace||'') + '</td>';
+    html += '<td title="' + (r.pod_uid||'') + '">' + (r.pod_uid ? r.pod_uid.substring(0,8)+'…' : '-') + '</td>';
+    html += '<td>' + (r.container_name||'') + '</td>';
+    html += '<td title="' + (r.device_uuid||'') + '">' + (r.device_uuid ? r.device_uuid.substring(0,12)+'…' : '-') + '</td>';
+    html += '<td>' + (r.device_type||'') + '</td>';
+    html += '<td class="num">' + (r.vdevice_id||'-') + '</td>';
+    html += '<td title="' + (r.image_id || r.image||'') + '">' + (r.image||'') + '</td>';
+    html += '<td title="' + (r.image_id||'') + '">' + (r.image_id ? r.image_id.substring(0,20)+'…' : '-') + '</td>';
+    html += '<td>' + (r.metric_name||'-') + '</td>';
     html += '<td class="num" style="color:var(--success);font-weight:600">' + r.peak_value_mib + '</td>';
+    html += '<td>' + fmtTime(r.start_time) + '</td>';
+    html += '<td>' + fmtTime(r.end_time) + '</td>';
     html += '<td class="num">' + (r.duration_seconds ? r.duration_seconds.toFixed(1) : '-') + '</td>';
-    html += '<td>' + created + '</td>';
+    html += '<td>' + (r.pod_phase||'-') + '</td>';
+    html += '<td>' + fmtTime(r.created_at) + '</td>';
     html += '</tr>';
   });
 
